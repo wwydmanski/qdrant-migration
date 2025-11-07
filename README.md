@@ -573,6 +573,7 @@ These options apply to all migrations, regardless of the source.
 | Flag                                 | Description                                                          |
 | ------------------------------------ | -------------------------------------------------------------------- |
 | `--migration.batch-size`             | Migration batch size. Default: 50                                    |
+| `--migration.parallel-uploads`       | Number of concurrent uploads to Qdrant. Default: 4                   |
 | `--migration.restart`                | Restart migration without resuming from offset. Default: false       |
 | `--migration.create-collection`      | Create the collection if it doesn't exist. Default: true             |
 | `--migration.offsets-collection`     | Collection to store migration offset. Default: `"_migration_offsets"`|

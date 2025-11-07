@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"github.com/pterm/pterm"
@@ -234,7 +235,121 @@ func (r *MigrateFromQdrantCmd) migrateData(ctx context.Context, sourceClient *qd
 	bar, _ := pterm.DefaultProgressbar.WithTotal(int(sourcePointCount)).Start()
 	displayMigrationProgress(bar, offsetCount)
 
+	workers := r.Migration.ParallelUploads
+	if workers < 1 {
+		workers = 1
+	}
+
+	type upsertResult struct {
+		seq        int
+		nextOffset *qdrant.PointId
+		count      int
+		err        error
+	}
+
+	resultCh := make(chan upsertResult)
+	errCh := make(chan error, 1)
+
+	var once sync.Once
+	sendErr := func(err error) {
+		if err == nil {
+			return
+		}
+		once.Do(func() {
+			errCh <- err
+		})
+	}
+
+	pending := make(map[int]upsertResult)
+	var commitWg sync.WaitGroup
+	commitWg.Add(1)
+	go func() {
+		defer commitWg.Done()
+		defer close(errCh)
+
+		nextToCommit := 0
+		failed := false
+
+		process := func(res upsertResult) {
+			pending[res.seq] = res
+			for {
+				current, ok := pending[nextToCommit]
+				if !ok {
+					break
+				}
+
+				offsetCount += uint64(current.count)
+
+				if err := commons.StoreStartOffset(ctx, r.Migration.OffsetsCollection, targetClient, sourceCollection, current.nextOffset, offsetCount); err != nil {
+					sendErr(fmt.Errorf("failed to store offset: %w", err))
+					failed = true
+					return
+				}
+
+				bar.Add(current.count)
+
+				delete(pending, nextToCommit)
+				nextToCommit++
+			}
+		}
+
+		for res := range resultCh {
+			if failed {
+				continue
+			}
+
+			if res.err != nil {
+				sendErr(res.err)
+				failed = true
+				continue
+			}
+
+			process(res)
+		}
+
+		if failed {
+			return
+		}
+
+		// Process any remaining batches if the channel was closed after all results were received.
+		for {
+			current, ok := pending[nextToCommit]
+			if !ok {
+				break
+			}
+
+			offsetCount += uint64(current.count)
+
+			if err := commons.StoreStartOffset(ctx, r.Migration.OffsetsCollection, targetClient, sourceCollection, current.nextOffset, offsetCount); err != nil {
+				sendErr(fmt.Errorf("failed to store offset: %w", err))
+				return
+			}
+
+			bar.Add(current.count)
+
+			delete(pending, nextToCommit)
+			nextToCommit++
+		}
+	}()
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, workers)
+	seq := 0
+	var runErr error
+
 	for {
+		select {
+		case err, ok := <-errCh:
+			if ok && err != nil {
+				runErr = err
+			}
+		default:
+		}
+
+		if runErr != nil {
+			break
+		}
+
 		resp, err := sourceClient.GetPointsClient().Scroll(ctx, &qdrant.ScrollPoints{
 			CollectionName: sourceCollection,
 			Offset:         offsetId,
@@ -243,92 +358,136 @@ func (r *MigrateFromQdrantCmd) migrateData(ctx context.Context, sourceClient *qd
 			WithVectors:    qdrant.NewWithVectors(true),
 		})
 		if err != nil {
-			return fmt.Errorf("failed to scroll data from source: %w", err)
-		}
-
-		points := resp.GetResult()
-		offsetId = resp.GetNextPageOffset()
-
-		var targetPoints []*qdrant.PointStruct
-		getVector := func(vector *qdrant.VectorOutput) *qdrant.Vector {
-			if vector == nil {
-				return nil
-			}
-			return &qdrant.Vector{
-				Data:         vector.GetData(),
-				Indices:      vector.GetIndices(),
-				VectorsCount: vector.VectorsCount,
-			}
-		}
-		getNamedVectors := func(vectors map[string]*qdrant.VectorOutput) map[string]*qdrant.Vector {
-			result := make(map[string]*qdrant.Vector, len(vectors))
-			for k, v := range vectors {
-				result[k] = getVector(v)
-			}
-			return result
-		}
-		getVectors := func(vectors *qdrant.NamedVectorsOutput) *qdrant.NamedVectors {
-			if vectors == nil {
-				return nil
-			}
-			return &qdrant.NamedVectors{
-				Vectors: getNamedVectors(vectors.GetVectors()),
-			}
-		}
-		getVectorsFromPoint := func(point *qdrant.RetrievedPoint) *qdrant.Vectors {
-			if point.Vectors == nil {
-				return nil
-			}
-			if vector := point.Vectors.GetVector(); vector != nil {
-				return &qdrant.Vectors{
-					VectorsOptions: &qdrant.Vectors_Vector{
-						Vector: getVector(vector),
-					},
-				}
-			}
-			if vectors := point.Vectors.GetVectors(); vectors != nil {
-				return &qdrant.Vectors{
-					VectorsOptions: &qdrant.Vectors_Vectors{
-						Vectors: getVectors(vectors),
-					},
-				}
-			}
-			return nil
-		}
-		for _, point := range points {
-			targetPoints = append(targetPoints, &qdrant.PointStruct{
-				Id:      point.Id,
-				Payload: point.Payload,
-				Vectors: getVectorsFromPoint(point),
-			})
-		}
-
-		_, err = targetClient.Upsert(ctx, &qdrant.UpsertPoints{
-			CollectionName: targetCollection,
-			Points:         targetPoints,
-			Wait:           qdrant.PtrOf(true),
-		})
-
-		if err != nil {
-			return fmt.Errorf("failed to insert data into target: %w", err)
-		}
-
-		offsetCount += uint64(len(points))
-
-		err = commons.StoreStartOffset(ctx, r.Migration.OffsetsCollection, targetClient, sourceCollection, offsetId, offsetCount)
-		if err != nil {
-			return fmt.Errorf("failed to store offset: %w", err)
-		}
-
-		bar.Add(len(points))
-
-		if offsetId == nil {
+			runErr = fmt.Errorf("failed to scroll data from source: %w", err)
 			break
 		}
 
+		points := resp.GetResult()
+		if len(points) == 0 {
+			break
+		}
+
+		nextOffset := resp.GetNextPageOffset()
+		targetPoints := make([]*qdrant.PointStruct, len(points))
+		for i, point := range points {
+			targetPoints[i] = &qdrant.PointStruct{
+				Id:      point.Id,
+				Payload: point.Payload,
+				Vectors: convertVectorsFromPoint(point),
+			}
+		}
+
+		sem <- struct{}{}
+		wg.Add(1)
+		currentSeq := seq
+		seq++
+
+		go func(points []*qdrant.PointStruct, count int, seq int, nextOffset *qdrant.PointId) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			_, err := targetClient.Upsert(ctx, &qdrant.UpsertPoints{
+				CollectionName: targetCollection,
+				Points:         points,
+				Wait:           qdrant.PtrOf(true),
+			})
+
+			if err != nil {
+				resultCh <- upsertResult{
+					seq: seq,
+					err: fmt.Errorf("failed to insert data into target: %w", err),
+				}
+				return
+			}
+
+			resultCh <- upsertResult{
+				seq:        seq,
+				nextOffset: nextOffset,
+				count:      count,
+			}
+		}(targetPoints, len(points), currentSeq, nextOffset)
+
+		offsetId = nextOffset
+
+		if nextOffset == nil {
+			break
+		}
+	}
+
+	wg.Wait()
+	close(resultCh)
+	commitWg.Wait()
+
+	for err := range errCh {
+		if err != nil {
+			return err
+		}
+	}
+
+	if runErr != nil {
+		return runErr
 	}
 
 	pterm.Success.Printfln("Data migration finished successfully")
+
+	return nil
+}
+
+func convertVectorOutput(vector *qdrant.VectorOutput) *qdrant.Vector {
+	if vector == nil {
+		return nil
+	}
+
+	return &qdrant.Vector{
+		Data:         vector.GetData(),
+		Indices:      vector.GetIndices(),
+		VectorsCount: vector.VectorsCount,
+	}
+}
+
+func convertNamedVectorsOutput(vectors map[string]*qdrant.VectorOutput) map[string]*qdrant.Vector {
+	if len(vectors) == 0 {
+		return nil
+	}
+
+	result := make(map[string]*qdrant.Vector, len(vectors))
+	for key, value := range vectors {
+		result[key] = convertVectorOutput(value)
+	}
+
+	return result
+}
+
+func convertVectorsOutput(vectors *qdrant.NamedVectorsOutput) *qdrant.NamedVectors {
+	if vectors == nil {
+		return nil
+	}
+
+	return &qdrant.NamedVectors{
+		Vectors: convertNamedVectorsOutput(vectors.GetVectors()),
+	}
+}
+
+func convertVectorsFromPoint(point *qdrant.RetrievedPoint) *qdrant.Vectors {
+	if point == nil || point.Vectors == nil {
+		return nil
+	}
+
+	if vector := point.Vectors.GetVector(); vector != nil {
+		return &qdrant.Vectors{
+			VectorsOptions: &qdrant.Vectors_Vector{
+				Vector: convertVectorOutput(vector),
+			},
+		}
+	}
+
+	if vectors := point.Vectors.GetVectors(); vectors != nil {
+		return &qdrant.Vectors{
+			VectorsOptions: &qdrant.Vectors_Vectors{
+				Vectors: convertVectorsOutput(vectors),
+			},
+		}
+	}
 
 	return nil
 }
