@@ -218,6 +218,9 @@ func getFieldType(dataType qdrant.PayloadSchemaType) *qdrant.FieldType {
 }
 
 func (r *MigrateFromQdrantCmd) migrateData(ctx context.Context, sourceClient *qdrant.Client, sourceCollection string, targetClient *qdrant.Client, targetCollection string, sourcePointCount uint64) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	limit := uint32(r.Migration.BatchSize)
 
 	var offsetId *qdrant.PointId
@@ -247,7 +250,14 @@ func (r *MigrateFromQdrantCmd) migrateData(ctx context.Context, sourceClient *qd
 		err        error
 	}
 
-	resultCh := make(chan upsertResult)
+	type upsertJob struct {
+		seq        int
+		points     []*qdrant.RetrievedPoint
+		nextOffset *qdrant.PointId
+	}
+
+	resultCh := make(chan upsertResult, workers*2)
+	jobs := make(chan upsertJob, workers*2)
 	errCh := make(chan error, 1)
 
 	var once sync.Once
@@ -257,6 +267,7 @@ func (r *MigrateFromQdrantCmd) migrateData(ctx context.Context, sourceClient *qd
 		}
 		once.Do(func() {
 			errCh <- err
+			cancel()
 		})
 	}
 
@@ -332,33 +343,94 @@ func (r *MigrateFromQdrantCmd) migrateData(ctx context.Context, sourceClient *qd
 		}
 	}()
 
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, workers)
+	var workerWg sync.WaitGroup
+	workerWg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer workerWg.Done()
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case job, ok := <-jobs:
+					if !ok {
+						return
+					}
+
+					if len(job.points) == 0 {
+						select {
+						case resultCh <- upsertResult{seq: job.seq, nextOffset: job.nextOffset}:
+						case <-ctx.Done():
+						}
+						continue
+					}
+
+					targetPoints := make([]*qdrant.PointStruct, len(job.points))
+					for i, point := range job.points {
+						targetPoints[i] = &qdrant.PointStruct{
+							Id:      point.Id,
+							Payload: point.Payload,
+							Vectors: convertVectorsFromPoint(point),
+						}
+					}
+
+					_, err := targetClient.Upsert(ctx, &qdrant.UpsertPoints{
+						CollectionName: targetCollection,
+						Points:         targetPoints,
+						Wait:           qdrant.PtrOf(true),
+					})
+					if err != nil {
+						select {
+						case resultCh <- upsertResult{seq: job.seq, err: fmt.Errorf("failed to insert data into target: %w", err)}:
+						case <-ctx.Done():
+						}
+						return
+					}
+
+					select {
+					case resultCh <- upsertResult{seq: job.seq, nextOffset: job.nextOffset, count: len(job.points)}:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	scrollClient := sourceClient.GetPointsClient()
+	withPayload := qdrant.NewWithPayload(true)
+	withVectors := qdrant.NewWithVectors(true)
+	scrollRequest := &qdrant.ScrollPoints{
+		CollectionName: sourceCollection,
+		Limit:          &limit,
+		WithPayload:    withPayload,
+		WithVectors:    withVectors,
+	}
+
 	seq := 0
 	var runErr error
 
+loop:
 	for {
 		select {
 		case err, ok := <-errCh:
-			if ok && err != nil {
+			if !ok {
+				break loop
+			}
+			if err != nil {
 				runErr = err
 			}
+			break loop
 		default:
 		}
 
-		if runErr != nil {
-			break
-		}
+		scrollRequest.Offset = offsetId
 
-		resp, err := sourceClient.GetPointsClient().Scroll(ctx, &qdrant.ScrollPoints{
-			CollectionName: sourceCollection,
-			Offset:         offsetId,
-			Limit:          &limit,
-			WithPayload:    qdrant.NewWithPayload(true),
-			WithVectors:    qdrant.NewWithVectors(true),
-		})
+		resp, err := scrollClient.Scroll(ctx, scrollRequest)
 		if err != nil {
 			runErr = fmt.Errorf("failed to scroll data from source: %w", err)
+			sendErr(runErr)
 			break
 		}
 
@@ -368,44 +440,19 @@ func (r *MigrateFromQdrantCmd) migrateData(ctx context.Context, sourceClient *qd
 		}
 
 		nextOffset := resp.GetNextPageOffset()
-		targetPoints := make([]*qdrant.PointStruct, len(points))
-		for i, point := range points {
-			targetPoints[i] = &qdrant.PointStruct{
-				Id:      point.Id,
-				Payload: point.Payload,
-				Vectors: convertVectorsFromPoint(point),
-			}
-		}
 
-		sem <- struct{}{}
-		wg.Add(1)
-		currentSeq := seq
+		job := upsertJob{
+			seq:        seq,
+			points:     points,
+			nextOffset: nextOffset,
+		}
 		seq++
 
-		go func(points []*qdrant.PointStruct, count int, seq int, nextOffset *qdrant.PointId) {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			_, err := targetClient.Upsert(ctx, &qdrant.UpsertPoints{
-				CollectionName: targetCollection,
-				Points:         points,
-				Wait:           qdrant.PtrOf(true),
-			})
-
-			if err != nil {
-				resultCh <- upsertResult{
-					seq: seq,
-					err: fmt.Errorf("failed to insert data into target: %w", err),
-				}
-				return
-			}
-
-			resultCh <- upsertResult{
-				seq:        seq,
-				nextOffset: nextOffset,
-				count:      count,
-			}
-		}(targetPoints, len(points), currentSeq, nextOffset)
+		select {
+		case jobs <- job:
+		case <-ctx.Done():
+			break loop
+		}
 
 		offsetId = nextOffset
 
@@ -414,14 +461,20 @@ func (r *MigrateFromQdrantCmd) migrateData(ctx context.Context, sourceClient *qd
 		}
 	}
 
-	wg.Wait()
+	close(jobs)
+	workerWg.Wait()
 	close(resultCh)
 	commitWg.Wait()
 
+	var reportedErr error
 	for err := range errCh {
 		if err != nil {
-			return err
+			reportedErr = err
 		}
+	}
+
+	if reportedErr != nil {
+		return reportedErr
 	}
 
 	if runErr != nil {
